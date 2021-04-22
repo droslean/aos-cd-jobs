@@ -1,66 +1,70 @@
-properties(
-  [
-    disableConcurrentBuilds(),
-    disableResume(),
-    buildDiscarder(
-      logRotator(
-        artifactDaysToKeepStr: '60',
-        daysToKeepStr: '60')
-    ),
-  ]
-)
+#!/usr/bin/env groovy
+node {
+    checkout scm
+    load("pipeline-scripts/commonlib.groovy").describeJob("rosa_sync", """
+        ------------------------------------------------------
+        Sync ROSA (Red Hat OpenShift Service on AWS) to mirror
+        ------------------------------------------------------
+        http://mirror.openshift.com/pub/openshift-v4/clients/rosa_sync/
 
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
+        Timing: This is only ever run by humans, upon request.
+    """)
 }
 
-node('openshift-build-1') {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
-        }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-virtualenv ../env/ -p python3
-. ../env/bin/activate
-pip install gitpython
-export GIT_PYTHON_TRACE=full
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
-        }
-      }
+pipeline {
+    agent any
+    options { disableResume() }
+
+    parameters {
+        string(
+            name: "VERSION",
+            description: "Desired version name. Example: 1.6.0",
+            defaultValue: "",
+            trim: true,
+        )
+        string(
+            name: "SOURCES_LOCATION",
+            description: "Example: https://download.eng.bos.redhat.com/staging-cds/developer/rosa/1.0.5-1856674/signed/all/",
+            defaultValue: "",
+            trim: true,
+        )
     }
-  } catch(err) {
-    mail(
-      to: 'jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encountered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
-""")
-    throw err
-  }
+
+    stages {
+        stage("Validate params") {
+            steps {
+                script {
+                    if (!params.VERSION) {
+                        error "VERSION must be specified"
+                    }
+                }
+            }
+        }
+        stage("Clean working dir") {
+            steps {
+                sh "rm -rf ${params.VERSION}"
+            }
+        }
+        stage("Download binaries") {
+            steps {
+                script {
+                    downloadRecursive(params.SOURCES_LOCATION, params.VERSION)
+                }
+            }
+        }
+        stage("Sync to mirror") {
+            steps {
+                sh "tree ${params.VERSION}"
+                sshagent(['aos-cd-test']) {
+                    sh "scp -r ${params.VERSION} use-mirror-upload.ops.rhcloud.com:/srv/pub/openshift-v4/clients/rosa/"
+                    sh "ssh use-mirror-upload.ops.rhcloud.com -- ln --symbolic --force --no-dereference ${params.VERSION} /srv/pub/openshift-v4/clients/rosa/latest"
+                    sh "ssh use-mirror-upload.ops.rhcloud.com -- /usr/local/bin/push.pub.sh openshift-v4/clients/rosa -v"
+                }
+            }
+        }
+    }
+}
+
+def downloadRecursive(path, destination) {
+    sh "wget --recursive --no-parent --reject 'index.html*' --no-directories --directory-prefix ${destination} ${path}"
 }
